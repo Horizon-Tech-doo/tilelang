@@ -193,6 +193,22 @@ private:
         LOG(FATAL) << "T.reducer_scale on reducer `" << var
                    << "` outside any T.Parallel loop is not supported.";
       }
+      // ReducerPlanAndMaterialize checks which threads run the scale from the
+      // T.Parallel loop layout alone, so a conditional inside the loop could
+      // skip it on some of the threads holding a partial.
+      bool in_parallel = false;
+      for (const ContextFrame &frame : ctx_stack_) {
+        if (frame.node->IsInstance<ForNode>()) {
+          in_parallel |= static_cast<const ForNode *>(frame.node)->kind ==
+                         ForKind::kParallel;
+        } else if (in_parallel) {
+          LOG(FATAL) << "T.reducer_scale on reducer `" << var
+                     << "` may not appear under a conditional inside its "
+                        "T.Parallel loop: a thread that skips it would keep "
+                        "its partial unscaled. Fold the condition into the "
+                        "factor instead.";
+        }
+      }
       for (const auto &index : load->indices) {
         VisitExpr(index);
       }

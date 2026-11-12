@@ -170,11 +170,12 @@ TVM_DLL const Op &reducer_update();
 
 /// tl.reducer_scale(acc[indices], factor): multiply the accumulated sum of the
 /// logical output selected by `indices` by `factor`, as if every contribution
-/// so far had been scaled, without communicating. Same argument shape as
-/// tl.reducer_update. Valid on "sum" reducers only, since multiplication
-/// distributes over the sum, and only in a T.Parallel nest that runs on every
-/// thread holding a partial of that output, with a factor those threads agree
-/// on; ReducerPlanAndMaterialize checks the thread sets.
+/// so far and the tl.reducer_init starting value had been scaled, without
+/// communicating. Same argument shape as tl.reducer_update. Valid on "sum"
+/// reducers only, since multiplication distributes over the sum, and only in a
+/// T.Parallel nest that runs on every thread holding a partial of that output,
+/// with a factor those threads agree on; ReducerPlanAndMaterialize checks the
+/// thread sets.
 TVM_DLL const Op &reducer_scale();
 
 /*! \brief Parsed form of a tl.reducer_update or tl.reducer_scale call. */

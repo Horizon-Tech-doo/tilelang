@@ -443,9 +443,10 @@ def reducer_update(target: tirx.BufferLoad, value) -> tirx.PrimExpr:
 def reducer_scale(target: tirx.BufferLoad, factor) -> tirx.PrimExpr:
     """Multiply the sum accumulated so far for one logical output by `factor`.
 
-    The result is what scaling every earlier contribution would have given, so
-    no thread has to communicate. It lets a running sum that is rescaled at each
-    step, as in online softmax, be reduced once at the end::
+    The result is what scaling every earlier contribution, and the starting
+    value given to `T.reducer_init`, would have given, so no thread has to
+    communicate. It lets a running sum that is rescaled at each step, as in
+    online softmax, be reduced once at the end::
 
         for k in T.serial(n):
             for i in T.Parallel(M):
@@ -456,7 +457,8 @@ def reducer_scale(target: tirx.BufferLoad, factor) -> tirx.PrimExpr:
 
     Only "sum" reducers can be scaled. The enclosing `T.Parallel` must run on
     every thread holding a partial of `acc[indices]`, with its loop variables as
-    `indices`; the compiler rejects anything else. Each replica applies the
+    `indices`, and the call must not sit under a conditional inside that loop;
+    the compiler rejects anything else. Each replica applies the
     factor to its own partial, so `factor` must be equal on all of them, which a
     fragment read with the same indices gives.
 

@@ -9,7 +9,7 @@ from tilelang.tileop.base import GemmWarpPolicy
 
 
 @tilelang.jit(out_idx=[-1], target="hip")
-def _scaled_sum(M, N, steps, threads, one_thread_per_row=False):
+def _scaled_sum(M, N, steps, threads, one_thread_per_row=False, seed=None, conditional=False):
     layout = T.Fragment((M,), forward_fn=lambda i: (i, 0)) if one_thread_per_row else None
 
     @T.prim_func
@@ -26,7 +26,7 @@ def _scaled_sum(M, N, steps, threads, one_thread_per_row=False):
             f = T.alloc_fragment((M,), T.float32)
             r = T.alloc_fragment((M,), T.float32)
             acc = T.alloc_reducer((M,), T.float32, op="sum")
-            T.reducer_init(acc)
+            T.reducer_init(acc, seed)
             T.copy(B[0, 0], B_s)
             for k in T.serial(steps):
                 T.copy(A[k, 0, 0], A_s)
@@ -36,8 +36,13 @@ def _scaled_sum(M, N, steps, threads, one_thread_per_row=False):
                 T.reduce_max(s, m, dim=1)
                 for i in T.Parallel(M):
                     f[i] = T.exp(-T.abs(m[i]))
-                for i in T.Parallel(M, loop_layout=layout):
-                    T.reducer_scale(acc[i], f[i])
+                if conditional:
+                    for i in T.Parallel(M):
+                        if i < M // 2:
+                            T.reducer_scale(acc[i], f[i])
+                else:
+                    for i in T.Parallel(M, loop_layout=layout):
+                        T.reducer_scale(acc[i], f[i])
                 for i, j in T.Parallel(M, N):
                     T.reducer_update(acc[i], s[i, j])
             T.finalize_reducer(acc, r)
@@ -45,6 +50,14 @@ def _scaled_sum(M, N, steps, threads, one_thread_per_row=False):
                 out[i, j] = r[i]
 
     return main
+
+
+def _reference(A, B, seed=0.0):
+    ref = torch.full((A.shape[1],), seed, device="cuda")
+    for k in range(A.shape[0]):
+        scores = A[k].float() @ B.float().T
+        ref = ref * torch.exp(-scores.max(dim=1).values.abs()) + scores.sum(dim=1)
+    return ref
 
 
 @tilelang.testing.requires_rocm
@@ -55,10 +68,22 @@ def test_scaled_sum_matches_reference(threads, M, N):
     A = torch.randn(steps, M, 32, dtype=torch.float16, device="cuda")
     B = torch.randn(N, 32, dtype=torch.float16, device="cuda")
     out = kernel(A, B)
-    ref = torch.zeros(M, device="cuda")
-    for k in range(steps):
-        scores = A[k].float() @ B.float().T
-        ref = ref * torch.exp(-scores.max(dim=1).values.abs()) + scores.sum(dim=1)
+    ref = _reference(A, B)
+    assert (out - ref[:, None]).abs().max() <= 1e-2 * ref.abs().max()
+
+
+# A starting value is part of the sum, so every factor scales it too. Small inputs keep the
+# factors large enough that the scaled starting value stays far above the tolerance.
+@tilelang.testing.requires_rocm
+@pytest.mark.parametrize(("threads", "M", "N"), [(64, 64, 64), (256, 128, 64), (256, 64, 64)])
+def test_scale_applies_to_starting_value(threads, M, N):
+    steps, seed = 3, 100.0
+    kernel = _scaled_sum(M, N, steps, threads, seed=seed)
+    A = (0.03 * torch.randn(steps, M, 32, device="cuda")).half()
+    B = torch.randn(N, 32, dtype=torch.float16, device="cuda")
+    out = kernel(A, B)
+    ref = _reference(A, B, seed)
+    assert (ref - _reference(A, B)).abs().min() > 5e-2 * ref.abs().max()
     assert (out - ref[:, None]).abs().max() <= 1e-2 * ref.abs().max()
 
 
@@ -88,6 +113,12 @@ def _scale_max():
 def test_only_sum_can_be_scaled():
     with pytest.raises(Exception, match="only a sum reducer can be scaled"):
         _scale_max().get_kernel_source()
+
+
+@tilelang.testing.requires_rocm
+def test_scale_under_conditional_is_rejected():
+    with pytest.raises(Exception, match="under a conditional inside its T.Parallel loop"):
+        _scaled_sum(64, 64, 2, 64, conditional=True).get_kernel_source()
 
 
 @tilelang.testing.requires_rocm

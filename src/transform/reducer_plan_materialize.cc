@@ -319,6 +319,7 @@ struct NarrowDecision {
   bool packed{false};
   Var pack_lane_var;
   Fragment packed_layout; // storage_layout with an extra innermost lane dim
+  bool scaled{false};     // the epoch has tl.reducer_scale sites
 };
 
 /*! \brief Per-buffer access census plus the copy graph, used to decide
@@ -816,6 +817,7 @@ public:
           DLOG(INFO) << msg;
         }
         CheckScaleSites(epoch, decision->storage_layout);
+        decision->scaled = !epoch.scales.empty();
         rewriter.narrow_decisions_.emplace(var, *decision);
         // Destination-layout overrides must be registered BEFORE traversal:
         // LayoutInference publishes the stale entry on every block, and the
@@ -897,6 +899,10 @@ private:
     // between init and finalize — the finalize-time combine must read the
     // value the epoch opened with.
     Buffer seed_buffer;
+    // Product of the tl.reducer_scale factors applied so far, one per slot of
+    // `new_buffer`. Allocated only for a scaled epoch with a seed: the seed
+    // is part of the sum being scaled, so finalize adds seed * product.
+    Buffer seed_scale_buffer;
     bool narrow{false};
     std::vector<std::pair<int, int>> steps;
     // Packed accumulation: updates RMW `packed_buffer[slot, lane_var % 2]`;
@@ -957,6 +963,10 @@ private:
         if (it->second.seed_buffer.defined()) {
           // Plain per-thread register; no fragment layout to publish.
           new_allocs.push_back(it->second.seed_buffer);
+        }
+        if (it->second.seed_scale_buffer.defined()) {
+          new_allocs.push_back(it->second.seed_scale_buffer);
+          layout_map.Set(it->second.seed_scale_buffer, it->second.layout);
         }
         changed = true;
       } else {
@@ -1115,6 +1125,16 @@ private:
                  old_buffer->name + "_pk", old_buffer->data_alignment,
                  old_buffer->offset_factor, old_buffer->buffer_type);
     }
+    if (plan.seed.defined() && narrow_it != narrow_decisions_.end() &&
+        narrow_it->second.scaled) {
+      Var scale_var(old_buffer->data->name_hint + "_seed_scale",
+                    PointerType(PrimType(old_buffer->dtype), "local.fragment"));
+      plan.seed_scale_buffer =
+          Buffer(scale_var, old_buffer->dtype, old_buffer->shape,
+                 /*strides=*/{}, old_buffer->elem_offset,
+                 old_buffer->name + "_seed_scale", old_buffer->data_alignment,
+                 old_buffer->offset_factor, old_buffer->buffer_type);
+    }
     plans_.emplace(var, plan);
     return EmitInitStmts(plans_.at(var), call);
   }
@@ -1139,6 +1159,13 @@ private:
           << "`: duplicated epoch sites disagree about the seed";
       Stmt capture = BufferStore(stored.seed_buffer, VisitExpr(call->args[1]),
                                  {make_zero(DataType::Int(32))});
+      if (stored.seed_scale_buffer.defined()) {
+        Stmt fill_scale = Evaluate(
+            Call(DataType::Handle(), Fill::Get(),
+                 {MakeFullRegion(stored.seed_scale_buffer, kAccessWrite),
+                  make_const(stored.seed_scale_buffer->dtype, 1)}));
+        return SeqStmt({capture, fill, fill_scale});
+      }
       return SeqStmt({capture, fill});
     }
     return fill;
@@ -1196,16 +1223,20 @@ private:
     auto scale_one = [&](const Buffer &target, const Array<PrimExpr> &indices) {
       return BufferStore(target, BufferLoad(target, indices) * factor, indices);
     };
-    if (!plan.packed) {
-      return scale_one(plan.new_buffer, scale.indices);
-    }
     Array<Stmt> seq;
-    for (int lane = 0; lane < 2; ++lane) {
-      Array<PrimExpr> indices = scale.indices;
-      indices.push_back(IntImm(DataType::Int(32), lane));
-      seq.push_back(scale_one(plan.packed_buffer, indices));
+    if (!plan.packed) {
+      seq.push_back(scale_one(plan.new_buffer, scale.indices));
+    } else {
+      for (int lane = 0; lane < 2; ++lane) {
+        Array<PrimExpr> indices = scale.indices;
+        indices.push_back(IntImm(DataType::Int(32), lane));
+        seq.push_back(scale_one(plan.packed_buffer, indices));
+      }
     }
-    return SeqStmt(seq);
+    if (plan.seed_scale_buffer.defined()) {
+      seq.push_back(scale_one(plan.seed_scale_buffer, scale.indices));
+    }
+    return seq.size() == 1 ? seq[0] : SeqStmt(seq);
   }
 
   Stmt MaterializeFinalize(const CallNode *call) {
@@ -1275,7 +1306,9 @@ private:
       }
       // Narrow plan: combine only the reduction-axis splits (when any);
       // replication groups already hold equal values.
-      if (!plan.steps.empty() || plan.seed.defined()) {
+      const bool scaled_seed = plan.seed_scale_buffer.defined();
+      const bool plain_seed = plan.seed.defined() && !scaled_seed;
+      if (!plan.steps.empty() || plain_seed) {
         Array<PrimExpr> args = {
             MakeFullRegion(plan.new_buffer, kAccessReadWrite),
             IntImm(DataType::Int(32), static_cast<int>(plan.op))};
@@ -1285,11 +1318,40 @@ private:
         }
         Map<String, ObjectRef> annotations = call->annotations;
         annotations.Set("plan", Integer(1));
-        if (plan.seed.defined()) {
+        if (plain_seed) {
           annotations.Set("seed", plan.seed.value());
         }
         seq.push_back(Evaluate(Call(
             DataType::Handle(), FinalizeReducerOp::Get(), args, annotations)));
+      }
+      if (scaled_seed) {
+        // A scaled epoch adds seed * (product of its factors) per slot in
+        // place of the plain seed. After the collective every thread holding
+        // a slot holds its complete value, so the same frozen-layout nest as
+        // the fold applies it exactly once per logical output.
+        Array<Var> seed_vars;
+        Array<PrimExpr> seed_indices;
+        for (size_t d = 0; d < plan.new_buffer->shape.size(); ++d) {
+          Var v("__red_seed_" + std::to_string(d), DataType::Int(32));
+          seed_vars.push_back(v);
+          seed_indices.push_back(v);
+        }
+        Stmt add_seed = BufferStore(
+            plan.new_buffer,
+            BufferLoad(plan.new_buffer, seed_indices) +
+                plan.seed.value() *
+                    BufferLoad(plan.seed_scale_buffer, seed_indices),
+            seed_indices);
+        for (int d = static_cast<int>(seed_vars.size()) - 1; d >= 0; --d) {
+          Map<String, Any> annotations;
+          if (d == 0) {
+            annotations.Set(tl::attr::kParallelLoopLayout, plan.layout);
+          }
+          add_seed = For(seed_vars[d], make_zero(DataType::Int(32)),
+                         plan.new_buffer->shape[d], ForKind::kParallel,
+                         add_seed, std::nullopt, annotations);
+        }
+        seq.push_back(add_seed);
       }
       // Publish via tl.copy: it partitions by the destination layout, and
       // destination containment was proven (or the destination layout IS
